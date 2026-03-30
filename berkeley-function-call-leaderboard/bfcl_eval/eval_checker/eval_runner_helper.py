@@ -12,6 +12,117 @@ from bfcl_eval.constants.model_config import MODEL_CONFIG_MAPPING
 from bfcl_eval.utils import *
 
 
+def compute_param_stats_summary(per_entry_stats: list) -> dict:
+    """
+    Given a list of per-data-point param_level_stats dicts (from compute_param_level_stats),
+    compute descriptive statistics for each error taxonomy category.
+
+    Per-data-point score = numerator / denominator for ratio categories,
+    or raw count for redundant_information.
+    Data points where denominator == 0 are excluded (N/A) from all statistics.
+
+    Returns a dict keyed by category name, each containing:
+        mean, median, min, max, std, confidence_interval_95,
+        n (applicable data points), na_count, distribution (histogram), buckets.
+    """
+    RATIO_CATEGORIES = (
+        "missing_information",
+        "hallucinated_params",
+        "specification_mismatch",
+        "task_deviation",
+    )
+    DIST_BINS = ["0.0-0.2", "0.2-0.4", "0.4-0.6", "0.6-0.8", "0.8-1.0"]
+
+    def _bin(score):
+        if score <= 0.2:
+            return "0.0-0.2"
+        elif score <= 0.4:
+            return "0.2-0.4"
+        elif score <= 0.6:
+            return "0.4-0.6"
+        elif score <= 0.8:
+            return "0.6-0.8"
+        else:
+            return "0.8-1.0"
+
+    def _ratio_summary(scores):
+        n = len(scores)
+        if n == 0:
+            return None
+        mean = statistics.mean(scores)
+        std = statistics.stdev(scores) if n > 1 else 0.0
+        margin = 1.96 * (std / (n ** 0.5)) if n > 0 else 0.0
+        dist = {b: 0 for b in DIST_BINS}
+        buckets = {"perfect": 0, "partial": 0, "zero": 0}
+        for s in scores:
+            dist[_bin(s)] += 1
+            if s == 1.0:
+                buckets["perfect"] += 1
+            elif s == 0.0:
+                buckets["zero"] += 1
+            else:
+                buckets["partial"] += 1
+        return {
+            "mean": round(mean, 4),
+            "median": round(statistics.median(scores), 4),
+            "min": round(min(scores), 4),
+            "max": round(max(scores), 4),
+            "std": round(std, 4),
+            "confidence_interval_95": [round(mean - margin, 4), round(mean + margin, 4)],
+            "n": n,
+            "distribution": dist,
+            "buckets": buckets,
+        }
+
+    # Collect per-data-point scores for each ratio category
+    ratio_scores = {cat: [] for cat in RATIO_CATEGORIES}
+    na_counts = {cat: 0 for cat in RATIO_CATEGORIES}
+
+    # Collect raw counts for redundant_information
+    redundant_counts = []
+
+    valid_stats = [s for s in per_entry_stats if s is not None]
+
+    for stats in valid_stats:
+        for cat in RATIO_CATEGORIES:
+            den = stats[cat]["denominator"]
+            if den == 0:
+                na_counts[cat] += 1
+            else:
+                ratio_scores[cat].append(stats[cat]["numerator"] / den)
+
+        redundant_counts.append(stats["redundant_information"]["count"])
+
+    result = {}
+    for cat in RATIO_CATEGORIES:
+        summary = _ratio_summary(ratio_scores[cat])
+        if summary is not None:
+            summary["na_count"] = na_counts[cat]
+        result[cat] = summary
+
+    # redundant_information: count-based stats (no ratio, no N/A)
+    if redundant_counts:
+        counts = redundant_counts
+        n = len(counts)
+        mean = statistics.mean(counts)
+        std = statistics.stdev(counts) if n > 1 else 0.0
+        margin = 1.96 * (std / (n ** 0.5)) if n > 0 else 0.0
+        result["redundant_information"] = {
+            "mean": round(mean, 4),
+            "median": round(statistics.median(counts), 4),
+            "min": min(counts),
+            "max": max(counts),
+            "std": round(std, 4),
+            "confidence_interval_95": [round(mean - margin, 4), round(mean + margin, 4)],
+            "n": n,
+            "total_redundant_params": sum(counts),
+        }
+    else:
+        result["redundant_information"] = None
+
+    return result
+
+
 def calculate_weighted_accuracy(accuracy_dict_list, display_na_if_category_missing=True):
     has_na = False
     total_count = 0

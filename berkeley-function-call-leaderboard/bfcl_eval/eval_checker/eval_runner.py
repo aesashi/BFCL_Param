@@ -388,8 +388,9 @@ def _evaluate_single_ast_entry(
             "model_result_raw": model_result_item_raw,
             "model_result_decoded": model_result_item,
             "possible_answer": possible_answer_item,
+            "param_level_stats": checker_result.get("param_level_stats"),
         }
-    return {"valid": True}
+    return {"valid": True, "param_level_stats": checker_result.get("param_level_stats")}
 
 
 def format_sensitivity_runner(
@@ -635,6 +636,7 @@ def ast_file_runner(
 
     result = []
     correct_count = 0
+    all_param_stats = []
     for i in range(len(model_result)):
         index = model_result[i]["id"]
         model_result_item = model_result[i]["result"]
@@ -654,13 +656,23 @@ def ast_file_runner(
             has_tool_call_tag=False,
         )
 
+        if entry_result.get("param_level_stats") is not None:
+            all_param_stats.append(entry_result["param_level_stats"])
+
         if entry_result["valid"]:
             correct_count += 1
         else:
             result.append(entry_result)
 
+    param_stats_summary = compute_param_stats_summary(all_param_stats)
     return save_eval_results(
-        result, correct_count, model_result, test_category, model_name, score_dir
+        result,
+        correct_count,
+        model_result,
+        test_category,
+        model_name,
+        score_dir,
+        extra_header_fields={"param_level_stats": param_stats_summary},
     )
 
 

@@ -39,14 +39,37 @@ def ast_checker(
     model_name: str,
 ):
     if "parallel" in test_category:
-        return parallel_function_checker_no_order(
+        result = parallel_function_checker_no_order(
             func_description, model_output, possible_answer, language, model_name
         )
+        # Compute stats for each expected function, matching by function name
+        stats_list = []
+        for pa in possible_answer:
+            func_name_expected = list(pa.keys())[0]
+            func_desc = find_description(func_description, func_name_expected)
+            for mo in model_output:
+                stats = compute_param_level_stats(func_desc, mo, pa, language, model_name)
+                if stats is not None:
+                    stats_list.append(stats)
+                    break
+        result["param_level_stats"] = aggregate_param_level_stats(stats_list)
+        return result
 
     elif "multiple" in test_category:
-        return multiple_function_checker(
+        result = multiple_function_checker(
             func_description, model_output, possible_answer, language, model_name
         )
+        # multiple_function_checker only evaluates the first function call
+        func_name_expected = list(possible_answer[0].keys())[0]
+        func_desc = find_description(func_description, func_name_expected)
+        result["param_level_stats"] = (
+            compute_param_level_stats(
+                func_desc, model_output[0], possible_answer[0], language, model_name
+            )
+            if model_output
+            else None
+        )
+        return result
 
     else:
         if len(model_output) != 1:
@@ -54,11 +77,16 @@ def ast_checker(
                 "valid": False,
                 "error": ["Wrong number of functions."],
                 "error_type": "simple_function_checker:wrong_count",
+                "param_level_stats": None,
             }
 
-        return simple_function_checker(
+        result = simple_function_checker(
             func_description[0], model_output[0], possible_answer[0], language, model_name
         )
+        result["param_level_stats"] = compute_param_level_stats(
+            func_description[0], model_output[0], possible_answer[0], language, model_name
+        )
+        return result
 
 
 #### Helper functions for AST ####
@@ -327,6 +355,180 @@ def list_dict_checker(param: str, model_output: list, possible_answers: list):
         if flag:
             return {"valid": True, "error": []}
 
+    return result
+
+
+def compute_param_level_stats(
+    func_description: dict,
+    model_output: dict,
+    possible_answer: dict,
+    language: Language,
+    model_name: str,
+):
+    """
+    Compute parameter-level statistics for the 5-category error taxonomy.
+    Does not short-circuit — evaluates all params regardless of prior failures.
+
+    Returns None if the function name doesn't match (param stats are not computable).
+
+    Categories:
+      - missing_information:    required params the model included vs total required in GT
+      - hallucinated_params:    generated param keys that exist in schema vs all generated keys
+      - redundant_information:  count of params valid in schema but absent from GT
+      - specification_mismatch: correct-type params in (generated ∩ GT) vs size of (generated ∩ GT)
+      - task_deviation:         correct-value params in (generated ∩ GT) vs size of (generated ∩ GT)
+    """
+    func_name = func_description["name"]
+    func_name = convert_func_name(func_name, model_name)
+    param_details = func_description["parameters"]["properties"]
+    required_params = func_description["parameters"]["required"]
+    possible_answer_params = list(possible_answer.values())[0]
+
+    if func_name not in model_output:
+        return None
+
+    model_params = model_output[func_name]
+
+    # 1. Missing Information
+    missing_info_num = sum(1 for p in required_params if p in model_params)
+    missing_info_den = len(required_params)
+
+    # 2. Hallucinated Params
+    hallucinated_num = sum(1 for p in model_params if p in param_details)
+    hallucinated_den = len(model_params)
+
+    # 3. Redundant Information
+    redundant_count = sum(
+        1 for p in model_params
+        if p in param_details and p not in possible_answer_params
+    )
+
+    # Steps 4 & 5 operate on generated params ∩ GT
+    intersection = [p for p in model_params if p in possible_answer_params]
+    intersection_den = len(intersection)
+
+    spec_mismatch_num = 0
+    task_deviation_num = 0
+
+    for param in intersection:
+        value = model_params[param]
+        expected_type_description = param_details[param]["type"]
+        nested_type_converted = None
+
+        # Language-specific type conversion (mirrors simple_function_checker)
+        try:
+            if language == Language.JAVA:
+                expected_type_converted = JAVA_TYPE_CONVERSION[expected_type_description]
+                if expected_type_description in NESTED_CONVERSION_TYPE_LIST:
+                    nested_type = param_details[param]["items"]["type"]
+                    nested_type_converted = JAVA_TYPE_CONVERSION[nested_type]
+                    value = java_type_converter(value, expected_type_description, nested_type)
+                else:
+                    value = java_type_converter(value, expected_type_description)
+            elif language == Language.JAVASCRIPT:
+                expected_type_converted = JS_TYPE_CONVERSION[expected_type_description]
+                if expected_type_description in NESTED_CONVERSION_TYPE_LIST:
+                    nested_type = param_details[param]["items"]["type"]
+                    nested_type_converted = JS_TYPE_CONVERSION[nested_type]
+                    value = js_type_converter(value, expected_type_description, nested_type)
+                else:
+                    value = js_type_converter(value, expected_type_description)
+            elif language == Language.PYTHON:
+                expected_type_converted = PYTHON_TYPE_MAPPING[expected_type_description]
+                if expected_type_description in PYTHON_NESTED_TYPE_CHECK_LIST:
+                    nested_type = param_details[param]["items"]["type"]
+                    nested_type_converted = PYTHON_TYPE_MAPPING[nested_type]
+            else:
+                continue
+        except Exception:
+            continue  # Conversion failed → type error, skip param
+
+        if expected_type_description == "tuple" and type(value) == tuple:
+            value = list(value)
+        if language == Language.PYTHON and expected_type_description == "float" and type(value) == int:
+            value = float(value)
+
+        type_result = type_checker(
+            param,
+            value,
+            possible_answer_params[param],
+            expected_type_description,
+            expected_type_converted,
+            nested_type_converted,
+        )
+        is_variable = type_result["is_variable"]
+
+        if not type_result["valid"]:
+            continue  # Type wrong → spec mismatch and task deviation both fail for this param
+
+        spec_mismatch_num += 1
+
+        # Value check (only reachable if type is correct)
+        try:
+            if not is_variable:
+                if expected_type_converted == dict:
+                    value_correct = dict_checker(param, value, possible_answer_params[param])["valid"]
+                elif expected_type_converted == list and nested_type_converted == dict:
+                    value_correct = list_dict_checker(param, value, possible_answer_params[param])["valid"]
+                elif expected_type_converted == str:
+                    value_correct = string_checker(param, value, possible_answer_params[param])["valid"]
+                elif expected_type_converted == list:
+                    value_correct = list_checker(param, value, possible_answer_params[param])["valid"]
+                else:
+                    value_correct = value in possible_answer_params[param]
+            else:
+                value_correct = value in possible_answer_params[param]
+        except Exception:
+            value_correct = False
+
+        if value_correct:
+            task_deviation_num += 1
+
+    return {
+        "missing_information": {
+            "numerator": missing_info_num,
+            "denominator": missing_info_den,
+        },
+        "hallucinated_params": {
+            "numerator": hallucinated_num,
+            "denominator": hallucinated_den,
+        },
+        "redundant_information": {
+            "count": redundant_count,
+        },
+        "specification_mismatch": {
+            "numerator": spec_mismatch_num,
+            "denominator": intersection_den,
+        },
+        "task_deviation": {
+            "numerator": task_deviation_num,
+            "denominator": intersection_den,
+        },
+    }
+
+
+def aggregate_param_level_stats(stats_list: list):
+    """
+    Sum up param-level stats from multiple function calls or data points.
+    None entries (function name mismatch) are excluded from aggregation.
+    Returns None if no valid stats exist.
+    """
+    valid_stats = [s for s in stats_list if s is not None]
+    if not valid_stats:
+        return None
+
+    result = {
+        "missing_information": {"numerator": 0, "denominator": 0},
+        "hallucinated_params": {"numerator": 0, "denominator": 0},
+        "redundant_information": {"count": 0},
+        "specification_mismatch": {"numerator": 0, "denominator": 0},
+        "task_deviation": {"numerator": 0, "denominator": 0},
+    }
+    for stats in valid_stats:
+        for key in ("missing_information", "hallucinated_params", "specification_mismatch", "task_deviation"):
+            result[key]["numerator"] += stats[key]["numerator"]
+            result[key]["denominator"] += stats[key]["denominator"]
+        result["redundant_information"]["count"] += stats["redundant_information"]["count"]
     return result
 
 

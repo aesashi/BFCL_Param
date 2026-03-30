@@ -946,7 +946,7 @@ api_inference_model_map = {
         underscore_to_dot=False,
     ),
     "qwen3-8b-FC": ModelConfig(
-        model_name="qwen3-8b",
+        model_name="qwen3-8b-FC",
         display_name="Qwen3-8B (FC)",
         url="https://huggingface.co/Qwen/Qwen3-8B",
         org="Qwen",
